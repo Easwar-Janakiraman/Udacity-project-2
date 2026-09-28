@@ -2,3 +2,4 @@
 aws/
 uv.lock
 __pycache__/
+.bedrock_agentcore/
