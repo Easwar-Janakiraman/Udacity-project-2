@@ -1,0 +1,10 @@
+Working on this customer support agent helped me understand how different AWS services can be combined to build something more useful than a basic chatbot. 
+One integration I used was the AgentCore Gateway with MCP. I chose this approach because the agent needed to interact with existing customer and order functionality, 
+such as looking up orders and processing refunds. Instead of putting all of that logic directly inside the agent, I exposed the required functionality through the Gateway as tools. 
+This also made the agent easier to extend because new backend capabilities can be added as tools without changing the main agent logic.
+One challenge I faced was getting the different parts of the AgentCore setup working together correctly. In particular, I had to verify that the Gateway connection was actually exposing the expected tools. 
+At one point, the tool listing only showed MCP tool objects, so I checked the Gateway connection directly and verified that six tools were being returned.
+I also had to make sure the conversation summarization code matched the version of Strands installed in the project. I initially considered implementing my own token-based summarization, 
+but after checking the available API, I switched to Strands' SummarizingConversationManager. This reduced custom logic and made the implementation cleaner.
+For production, scalability and cost would be important considerations. A customer support agent can have long conversations and many simultaneous users,
+so keeping the full conversation history in every request would increase the amount of context sent to the model. Using conversation summarization helps control that growth while keeping recent messages available.
