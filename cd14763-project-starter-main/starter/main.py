@@ -21,7 +21,7 @@ from bedrock_agentcore.tools.code_interpreter_client import code_session
 from strands_tools.browser import AgentCoreBrowser
 from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("CSAI_Agent")
 
 
@@ -41,6 +41,7 @@ MEMORY_ID   = "CustomerSupportMemory-22B3IX24wm"
 class DiscountBreakdown(BaseModel):
     points_redeemed: int = Field(ge=0)
     points_value: float = Field(ge=0)
+    tier_discount_pct: float = Field(ge=0)
     tier_discount: float = Field(ge=0)
     final_total: float = Field(ge=0)
     total_savings: float = Field(ge=0)
@@ -341,11 +342,15 @@ tier_rates = {{
 }}
 
 earn_rate = earn_rates.get(product_category, 1)
-tier_rate = tier_rates.get(tier, 0.00)
+tier_discount_pct = tier_rates.get(tier, 0.00)
+
+max_points_by_order = math.floor(
+    (order_total * 0.50) / 5
+) * 500
 
 points_redeemed = min(
     (loyalty_points // 500) * 500,
-    math.floor(order_total * 0.50 / 0.01)
+    max_points_by_order
 )
 
 points_value = points_redeemed / 100
@@ -355,7 +360,7 @@ subtotal_after_points = max(
     0
 )
 
-tier_discount = subtotal_after_points * tier_rate
+tier_discount = subtotal_after_points * tier_discount_pct
 
 final_total = max(
     subtotal_after_points - tier_discount,
@@ -369,13 +374,14 @@ points_earned = math.floor(final_total * earn_rate)
 remaining_points = loyalty_points - points_redeemed
 
 result = {{
-    "points_redeemed": points_redeemed,
-    "points_value": round(points_value, 2),
-    "tier_discount": round(tier_discount, 2),
-    "final_total": round(final_total, 2),
-    "total_savings": round(total_savings, 2),
-    "points_earned": points_earned,
-    "remaining_points": remaining_points
+    "points_redeemed": int(points_redeemed),
+    "points_value": float(round(points_value, 2)),
+    "tier_discount_pct": float(tier_discount_pct),
+    "tier_discount": float(round(tier_discount, 2)),
+    "final_total": float(round(final_total, 2)),
+    "total_savings": float(round(total_savings, 2)),
+    "points_earned": int(points_earned),
+    "remaining_points": int(remaining_points)
 }}
 
 print(json.dumps(result))
@@ -420,13 +426,14 @@ print(json.dumps(result))
             "Platinum": 0.15,
         }
 
-        tier_rate = tier_rates.get(tier, 0.00)
-        tier_discount = order_total * tier_rate
+        tier_discount_pct = tier_rates.get(tier, 0.00)
+        tier_discount = subtotal_after_points * tier_discount_pct
         final_total = order_total - tier_discount
 
         fallback_result = DiscountBreakdown(
             points_redeemed=0,
             points_value=0.0,
+            tier_discount_pct=tier_discount_pct,
             tier_discount=round(tier_discount, 2),
             final_total=round(final_total, 2),
             total_savings=round(tier_discount, 2),
@@ -486,20 +493,42 @@ async def invoke(payload, context=None):
             lambda: streamable_http_client(GATEWAY_URL)
         )
 
-        with gateway_client:
-            gateway_tools = gateway_client.list_tools_sync()
+        try:
+            with gateway_client:
+                try:
+                    gateway_tools = gateway_client.list_tools_sync()
+                    tools.extend(gateway_tools)
 
-            # Add Gateway tools to the local tools
-            tools.extend(gateway_tools)
+                    logger.info(
+                        "Gateway connected successfully. Loaded %d tools.",
+                        len(gateway_tools),
+                    )
 
-            # 6. Create the Strands Agent
-            agent = Agent(
-                model=model,
-                tools=tools,
-                hooks=[memory_hook],
-                messages=conversation_history,
-                conversation_manager=conversation_manager,
-                system_prompt="""
+                except TimeoutError:
+                    logger.exception("Gateway tool loading timed out")
+
+                except ConnectionError:
+                    logger.exception("Gateway connection failed")
+
+                except Exception as exc:
+                    logger.exception(
+                        "Gateway tool loading failed: %s", exc
+                    )
+
+        except Exception as exc:
+            logger.exception(
+                "Gateway connection failed during setup: %s",
+                exc,
+            )
+
+        # 6. Create the Strands Agent
+        agent = Agent(
+            model=model,
+            tools=tools,
+            hooks=[memory_hook],
+            messages=conversation_history,
+            conversation_manager=conversation_manager,
+            system_prompt="""
 You are a helpful customer support assistant for an e-commerce platform.
 
 You can help customers with:
@@ -535,8 +564,8 @@ or loyalty calculations.
 """,
             )
 
-            # 7. Invoke the agent
-            response = agent(user_input)
+        # 7. Invoke the agent
+        response = agent(user_input)
 
         # 8. Return the response text
         if response and response.message:
