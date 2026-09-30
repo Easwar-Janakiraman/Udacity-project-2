@@ -309,17 +309,22 @@ def calculate_loyalty_discount(
 ) -> str:
     """
     Calculate the loyalty discount for a customer order using the
-    AgentCore Code Interpreter. Runs exact arithmetic in a secure sandbox.
+    AgentCore Code Interpreter.
+
+    If the Code Interpreter is unavailable, the tool falls back to
+    a tier-only discount calculation without redeeming points.
 
     Args:
-        loyalty_points:   Customer's current points balance
-        tier:             Customer tier — Silver, Gold, or Platinum
-        order_total:      Order total in USD
+        loyalty_points: Customer's current points balance
+        tier: Customer tier — Silver, Gold, or Platinum
+        order_total: Order total in USD
         product_category: standard, device, or fresh
 
     Returns:
-        Full discount breakdown and final price
+        Structured discount breakdown and final price.
     """
+
+    # Business rules executed inside the sandboxed Code Interpreter.
     code = f"""
 import json
 import math
@@ -342,15 +347,13 @@ tier_rates = {{
 }}
 
 earn_rate = earn_rates.get(product_category, 1)
-tier_discount_pct = tier_rates.get(tier, 0.00)
+tier_rate = tier_rates.get(tier, 0.00)
 
-max_points_by_order = math.floor(
-    (order_total * 0.50) / 5
-) * 500
-
+# Redeem points in multiples of 500.
+# 100 points = $1, so the redemption cannot exceed 50% of the order value.
 points_redeemed = min(
     (loyalty_points // 500) * 500,
-    max_points_by_order
+    math.floor(order_total * 0.50 / 0.01)
 )
 
 points_value = points_redeemed / 100
@@ -360,7 +363,7 @@ subtotal_after_points = max(
     0
 )
 
-tier_discount = subtotal_after_points * tier_discount_pct
+tier_discount = subtotal_after_points * tier_rate
 
 final_total = max(
     subtotal_after_points - tier_discount,
@@ -374,21 +377,23 @@ points_earned = math.floor(final_total * earn_rate)
 remaining_points = loyalty_points - points_redeemed
 
 result = {{
-    "points_redeemed": int(points_redeemed),
-    "points_value": float(round(points_value, 2)),
-    "tier_discount_pct": float(tier_discount_pct),
-    "tier_discount": float(round(tier_discount, 2)),
-    "final_total": float(round(final_total, 2)),
-    "total_savings": float(round(total_savings, 2)),
-    "points_earned": int(points_earned),
-    "remaining_points": int(remaining_points)
+    "points_redeemed": points_redeemed,
+    "points_value": round(points_value, 2),
+    "tier_discount": round(tier_discount, 2),
+    "final_total": round(final_total, 2),
+    "total_savings": round(total_savings, 2),
+    "points_earned": points_earned,
+    "remaining_points": remaining_points,
+    "fallback": False
 }}
 
 print(json.dumps(result))
 """
 
     try:
+        
         with code_session(REGION) as session:
+        # with code_session('invalid-region') as session:
             response = session.invoke(
                 "executeCode",
                 {
@@ -399,9 +404,15 @@ print(json.dumps(result))
             )
 
         if not response:
-            raise RuntimeError("Code Interpreter returned no result")
+            raise RuntimeError(
+                "Code Interpreter returned no result"
+            )
 
-        first_result = response[0] if isinstance(response, list) else response
+        first_result = (
+            response[0]
+            if isinstance(response, list)
+            else response
+        )
 
         if isinstance(first_result, str):
             raw_result = first_result
@@ -410,14 +421,20 @@ print(json.dumps(result))
 
         parsed_result = json.loads(raw_result)
 
-        validated_result = DiscountBreakdown.model_validate(parsed_result)
+        validated_result = DiscountBreakdown.model_validate(
+            parsed_result
+        )
 
         return validated_result.model_dump_json()
 
-    except Exception as e:
+    except Exception as exc:
+        # Fallback path:
+        # Code Interpreter is unavailable or failed.
+        # No loyalty points are redeemed here.
+        # Only the customer's tier discount is applied.
         logger.warning(
-            "Code Interpreter unavailable, using fallback: %s",
-            e,
+            "Code Interpreter unavailable; using tier-only fallback: %s",
+            exc,
         )
 
         tier_rates = {
@@ -426,23 +443,36 @@ print(json.dumps(result))
             "Platinum": 0.15,
         }
 
-        tier_discount_pct = tier_rates.get(tier, 0.00)
-        tier_discount = subtotal_after_points * tier_discount_pct
-        final_total = order_total - tier_discount
+        tier_rate = tier_rates.get(tier, 0.00)
+
+        points_redeemed = 0
+        points_value = 0.0
+
+        tier_discount = order_total * tier_rate
+
+        final_total = max(
+            order_total - tier_discount,
+            0,
+        )
+
+        total_savings = tier_discount
+
+        points_earned = 0
+        remaining_points = loyalty_points
 
         fallback_result = DiscountBreakdown(
-            points_redeemed=0,
-            points_value=0.0,
-            tier_discount_pct=tier_discount_pct,
+            points_redeemed=points_redeemed,
+            points_value=points_value,
             tier_discount=round(tier_discount, 2),
             final_total=round(final_total, 2),
-            total_savings=round(tier_discount, 2),
-            points_earned=0,
-            remaining_points=loyalty_points,
+            total_savings=round(total_savings, 2),
+            points_earned=points_earned,
+            remaining_points=remaining_points,
             fallback=True,
         )
 
         return fallback_result.model_dump_json()
+ 
 
 
 @app.entrypoint
